@@ -244,7 +244,7 @@ void emit_payload()
 }
 
 int main() {
-    int debug_enabled, status;
+    int debug_enabled, status,i;
     pid_t pid;
 
     // Make sure the BPF JIT is enabled, and check if we have access to
