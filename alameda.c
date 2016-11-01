@@ -389,7 +389,6 @@ void get_root(uint64_t payload_addr) {
         fflush(stdout);
         die("failed to get root");
     }
-    printf("\ngot root!");
     fflush(stdout);
     info("got root!");
 
