@@ -4,9 +4,10 @@
 
 // When userspace writes a pointer to /proc/jump, jump to that address in
 // kernel mode.
-int jump_write(struct file *file, const char *buf,
-               unsigned long len, void *data) {
+ssize_t jump_write(struct file *file, const char *buf, size_t len, loff_t *data) {
     void (*fun)(void);
+    uint32_t *pcontent;
+    uint32_t content;
 
     if (len < sizeof(fun))
         return -EINVAL;
@@ -14,8 +15,8 @@ int jump_write(struct file *file, const char *buf,
     if (copy_from_user(&fun, buf, sizeof(fun)))
         return -EFAULT;
 
-    uint32_t* pcontent = (uint32_t*) fun;
-    uint32_t content = *pcontent;
+    pcontent = (uint32_t*) fun;
+    content = *pcontent;
     printk("jump.ko: Jumping to %p\n", fun);
     printk("jump.ko: content %x\n", content);
     fun();
@@ -23,13 +24,17 @@ int jump_write(struct file *file, const char *buf,
     return len;
 }
 
-static const struct file_operations proc_file_fops = {
- .write  = jump_write,
+static const struct proc_ops proc_file_fops = {
+ .proc_write  = jump_write,
 };
 
 // Create a file /proc/jump, with writes handled by jump_write.
 int init_jump(void) {
     struct proc_dir_entry *ent = proc_create("jump", 0666, NULL, &proc_file_fops);
+    if (!ent) {
+	printk("jump.ko: failed to allocate jump proc entry\n");
+	return -ENOMEM;
+    }
     printk("jump.ko: Loaded incredibly insecure kernel module\n");
     return 0;
 }
